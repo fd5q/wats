@@ -294,7 +294,36 @@ async function startBot() {
 }
 
 app.get("/qr", (req, res) => {
-  res.json({ qr: qrCode, connected });
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="ar" dir="rtl">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WhatsApp QR</title>
+    <body style="font-family:Arial;text-align:center;padding:25px">
+      <h2>ربط بوت واتساب</h2>
+      <div id="result">جاري تحميل الرمز...</div>
+      <script>
+        async function loadQR() {
+          const r = await fetch('/qr-data');
+          const d = await r.json();
+          const box = document.getElementById('result');
+          if (d.connected) {
+            box.innerHTML = 'واتساب متصل بالفعل';
+          } else if (d.qr) {
+            box.innerHTML = '<img style="width:280px;max-width:90%" src="' + d.qr + '"><p>امسح الرمز من واتساب</p>';
+          } else {
+            box.innerHTML = 'انتظر ظهور رمز QR...';
+          }
+        }
+        loadQR();
+        setInterval(loadQR, 3000);
+      </script>
+    </body>
+    </html>
+  `);
 });
 
+app.get("/qr-data", (req, res) => {
+  res.json({ qr: qrCode, connected });
+});
 startBot();
