@@ -2,261 +2,233 @@
 const express = require("express");
 const QRCode = require("qrcode");
 const pino = require("pino");
+
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason
 } = require("@whiskeysockets/baileys");
-const fs = require("fs");
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-const ADMIN = (process.env.ADMIN_PHONE || "").replace(/\D/g, "");
+const PORT = process.env.PORT || 3000;
 
 let sock;
-let qrImage = null;
+let qrCode = null;
 let connected = false;
-let botEnabled = true;
-let reconnecting = false;
+let enabled = true;
+let reconnectTimer = null;
 
 const users = new Set();
-const seen = new Set();
-const lastMessage = new Map();
+const ADMIN_PHONE = (process.env.ADMIN_PHONE || "").replace(/\D/g, "");
 
 app.get("/", (req, res) => {
   res.send(`
-<!DOCTYPE html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Fahad WhatsApp Bot</title>
-<style>
-body {
-  background:#101820;color:white;
-  font-family:Arial;text-align:center;
-  padding:35px 15px
-}
-.box {
-  max-width:390px;margin:auto;
-  background:#1d2935;padding:25px;
-  border-radius:20px
-}
-img {width:260px;max-width:100%;background:white;padding:10px;border-radius:12px}
-button {
-  background:#19b875;color:white;
-  padding:13px 25px;border:0;
-  border-radius:10px;margin:12px;
-  font-size:16px
-}
-</style>
-</head>
-<body>
-<div class="box">
-<h2>🤖 Fahad WhatsApp Bot</h2>
-<p id="status">جاري الاتصال...</p>
-<div id="qr">جاري تجهيز QR Code...</div>
-<p>افتح واتساب ← الأجهزة المرتبطة ← ربط جهاز</p>
-<button onclick="loadQR()">تحديث QR</button>
-</div>
-<script>
-async function loadQR(){
-  const r = await fetch('/qr');
-  const d = await r.json();
-  document.getElementById('qr').innerHTML =
-    d.qr ? '<img src="'+d.qr+'">' : d.connected ?
-    '✅ واتساب متصل' : '⏳ انتظر ظهور الرمز';
-}
-async function update(){
-  const r = await fetch('/status');
-  const d = await r.json();
-  document.getElementById('status').innerText =
-    d.connected ? '🟢 متصل' : '🔴 غير متصل';
-  if(!d.connected) await loadQR();
-}
-setInterval(update,4000);
-update();
-</script>
-</body>
-</html>
+    <html dir="rtl">
+      <head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+      <body style="font-family:Arial;text-align:center;padding:30px">
+        <h2>🤖 Fahad WhatsApp Bot</h2>
+        <p id="status">جاري تحميل الحالة...</p>
+        <img id="qr" style="max-width:300px;width:90%">
+        <script>
+          async function update() {
+            const r = await fetch('/qr');
+            const d = await r.json();
+            document.getElementById('status').innerText =
+              d.connected ? '✅ واتساب متصل' : '⏳ انتظر رمز الربط';
+            document.getElementById('qr').src = d.qr || '';
+          }
+          update();
+          setInterval(update, 5000);
+        </script>
+      </body>
+    </html>
   `);
 });
 
 app.get("/qr", (req, res) => {
-  res.json({ qr: qrImage, connected });
+  res.json({ qr: qrCode, connected });
+  
 });
 
 app.get("/status", (req, res) => {
   res.json({
     connected,
-    enabled: botEnabled,
+    enabled,
     users: users.size
   });
 });
 
-async function startBot() {
-  if (reconnecting) return;
-  reconnecting = true;
+app.listen(PORT, () => {
+  console.log("Server running on port " + PORT);
+});
 
-  try {
-    const { state, saveCreds } =
-      await useMultiFileAuthState("./auth_info_baileys");
-
-    sock = makeWASocket({
-      auth: state,
-      logger: pino({ level: "silent" }),
-      browser: ["Fahad Bot", "Chrome", "1.0.0"],
-      markOnlineOnConnect: false,
-      syncFullHistory: false
-    });
-
-    sock.ev.on("creds.update", saveCreds);
-
-    sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
-      if (qr) {
-        qrImage = await QRCode.toDataURL(qr);
-        connected = false;
-        console.log("QR Code is ready");
-      }
-
-      if (connection === "open") {
-        connected = true;
-        qrImage = null;
-        console.log("WhatsApp connected!");
-      }
-
-      if (connection === "close") {
-        connected = false;
-        qrImage = null;
-
-        const code = lastDisconnect?.error?.output?.statusCode;
-
-        if (code !== DisconnectReason.loggedOut) {
-          reconnecting = false;
-          setTimeout(startBot, 5000);
-        } else {
-          console.log("Logged out. Delete session and reconnect.");
-          reconnecting = false;
-        }
-      }
-    });
-
-    sock.ev.on("messages.upsert", async ({ messages, type }) => {
-      if (type !== "notify") return;
-
-      for (const msg of messages) {
-        try {
-          if (!msg.message || msg.key.fromMe) continue;
-          if (msg.key.remoteJid === "status@broadcast") continue;
-
-          const jid = msg.key.remoteJid;
-          if (jid.endsWith("@g.us")) continue;
-
-          const id = msg.key.id;
-          if (!id || seen.has(id)) continue;
-          seen.add(id);
-
-          if (seen.size > 3000) {
-            seen.clear();
-          }
-
-          const from = jid.split("@")[0];
-          users.add(from);
-
-          const body =
-            msg.message.conversation ||
-            msg.message.extendedTextMessage?.text ||
-            "";
-
-          if (!body.trim()) continue;
-
-          const now = Date.now();
-          const previous = lastMessage.get(from) || 0;
-
-          if (now - previous < 3000) continue;
-          lastMessage.set(from, now);
-
-          const isAdmin = from === ADMIN;
-          const command = body.trim().toLowerCase();
-
-          let reply = "";
-
-          // Owner commands
-          if (isAdmin && command === "!off") {
-            botEnabled = false;
-            reply = "🔴 تم إيقاف البوت.";
-          }
-          else if (isAdmin && command === "!on") {
-            botEnabled = true;
-            reply = "🟢 تم تشغيل البوت.";
-          }
-          else if (isAdmin && command === "!status") {
-            reply =
-              "حالة البوت: " + (connected ? "متصل 🟢" : "غير متصل") +
-              "\nعدد المستخدمين: " + users.size;
-          }
-          else if (isAdmin && command === "!users") {
-            reply = "عدد المستخدمين: " + users.size +
-              "\n" + [...users].slice(0, 30).join("\n");
-          }
-          else if (isAdmin && command === "!commands") {
-            reply =
-              "👑 أوامر المالك\n\n" +
-              "!on تشغيل البوت\n" +
-              "!off إيقاف البوت\n" +
-              "!status حالة البوت\n" +
-              "!users قائمة المستخدمين\n" +
-              "!commands الأوامر";
-          }
-          else if (!botEnabled && !isAdmin) {
-            continue;
-          }
-          else if (["!menu", "!help"].includes(command)) {
-            reply =
-              "🔥 أهلاً بك في بوت فهد\n\n" +
-              "!menu القائمة\n" +
-              "!about معلومات البوت\n" +
-              "!help المساعدة";
-          }
-          else if (command === "!about") {
-            reply = "🤖 Fahad WhatsApp Bot\nبوت مساعد متعدد المميزات.";
-          }
-          else if (["السلام عليكم", "سلام عليكم"].includes(command)) {
-            reply = "وعليكم السلام ورحمة الله وبركاته 🌹";
-          }
-          else if (command.includes("مرحبا") || command.includes("هلا")) {
-            reply = "يا هلا والله 👋";
-          }
-          else if (command.includes("كيف حالك")) {
-            reply = "بخير الحمد لله، وأنت؟ 😊";
-          }
-          else {
-            reply = "وصلت رسالتك ❤️\nاكتب !menu لعرض الأوامر.";
-          }
-
-          if (reply) {
-            await sock.sendMessage(jid, { text: reply });
-          }
-
-        } catch (error) {
-          console.error("Message error:", error);
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error("Bot startup error:", error);
-    reconnecting = false;
-    setTimeout(startBot, 10000);
-    return;
-  }
-
-  reconnecting = false;
+function getText(message) {
+  const m = message.message || {};
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    ""
+  ).trim();
 }
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Web server running on port " + PORT);
-  startBot();
+function isOwner(jid) {
+  if (!ADMIN_PHONE) return false;
+  const number = jid.split("@")[0].replace(/\D/g, "");
+  return number === ADMIN_PHONE;
+}
+
+async function startBot() {
+  const { state, saveCreds } =
+    await useMultiFileAuthState("./auth_info_baileys");
+
+  sock = makeWASocket({
+    auth: state,
+    logger: pino({ level: "silent" }),
+    browser: ["Fahad Bot", "Chrome", "1.0.0"],
+    printQRInTerminal: false
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      qrCode = await QRCode.toDataURL(qr);
+      console.log("QR code is ready");
+    }
+
+    if (connection === "open") {
+      connected = true;
+      qrCode = null;
+      console.log("WhatsApp connected successfully");
+    }
+
+    if (connection === "close") {
+      connected = false;
+
+      const statusCode =
+        lastDisconnect?.error?.output?.statusCode;
+
+      console.log("Connection closed:", statusCode);
+
+      if (statusCode !== DisconnectReason.loggedOut) {
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(startBot, 5000);
+      } else {
+        console.log("Session logged out. Scan a new QR code.");
+      }
+    }
+  });
+
+  // استقبال الرسائل والرد عليها
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    for (const msg of messages) {
+      if (!msg.message || msg.key.fromMe) continue;
+
+      const jid = msg.key.remoteJid;
+      if (!jid || jid === "status@broadcast") continue;
+
+      const text = getText(msg).toLowerCase();
+      const owner = isOwner(jid);
+      const isGroup = jid.endsWith("@g.us");
+
+      if (!isGroup) users.add(jid);
+
+      // أوامر المالك
+      if (owner && text === "!on") {
+        enabled = true;
+        await sock.sendMessage(jid, { text: "✅ تم تشغيل البوت." });
+        continue;
+      }
+
+      if (owner && text === "!off") {
+        enabled = false;
+        await sock.sendMessage(jid, { text: "⛔ تم إيقاف الردود التلقائية." });
+        continue;
+      }
+
+      if (owner && text === "!status") {
+        await sock.sendMessage(jid, {
+          text:
+            "📊 حالة البوت\n" +
+            "الاتصال: " + (connected ? "متصل ✅" : "غير متصل ❌") + "\n" +
+            "التشغيل: " + (enabled ? "مفعّل ✅" : "متوقف ⛔") + "\n" +
+            "المستخدمون: " + users.size
+        });
+        continue;
+      }
+
+      if (owner && text === "!users") {
+        await sock.sendMessage(jid, {
+          text: "👥 عدد المستخدمين المسجلين: " + users.size
+        });
+        continue;
+      }
+
+      // القائمة متاحة للجميع
+      if (text === "!menu" || text === "!help") {
+        await sock.sendMessage(jid, {
+          text:
+            "🤖 *قائمة أوامر بوت فهد*\n\n" +
+            "!menu — عرض القائمة\n" +
+            "!help — المساعدة\n" +
+            "!about — معلومات البوت\n\n" +
+            "أوامر المالك:\n" +
+            "!on — تشغيل البوت\n" +
+            "!off — إيقاف الردود\n" +
+            "!status — حالة البوت\n" +
+            "!users — عدد المستخدمين"
+        });
+        continue;
+      }
+
+      if (text === "!about") {
+        await sock.sendMessage(jid, {
+          text: "🤖 أنا بوت فهد، مساعد واتساب تلقائي."
+        });
+        continue;
+      }
+
+      if (!enabled) continue;
+
+      // الردود التلقائية
+      let reply = null;
+
+      if (text.includes("السلام عليكم")) {
+        reply = "وعليكم السلام ورحمة الله وبركاته 🌹";
+      } else if (text === "هلا" || text.includes("هلا والله")) {
+        reply = "يا هلا والله 👋";
+      } else if (text.includes("مرحبا") || text.includes("مرحباً")) {
+        reply = "أهلاً وسهلاً فيك ❤️";
+      } else if (text.includes("كيفك") || text.includes("شلونك")) {
+        reply = "الحمد لله بخير، وأنت كيف حالك؟ 😊";
+      } else if (text.includes("شكرا") || text.includes("شكراً")) {
+        reply = "العفو، بالخدمة دائمًا ❤️";
+      }
+
+      if (reply) {
+        await sock.sendMessage(jid, { text: reply });
+      }
+    }
+  });
+
+  // الترحيب بالأعضاء الجدد
+  sock.ev.on("group-participants.update", async (event) => {
+    if (event.action !== "add") return;
+
+    for (const participant of event.participants) {
+      await sock.sendMessage(event.id, {
+        text: `أهلاً وسهلاً بك 🎉\n@${participant.split("@")[0]}\nنورت المجموعة ❤️`,
+        mentions: [participant]
+      });
+    }
+  });
+}
+
+startBot().catch((err) => {
+  console.error("Bot startup error:", err);
 });
+ 
