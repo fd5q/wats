@@ -17,7 +17,7 @@ app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
-const GROQ_MODEL = "llama-3.3-70b-versatile";
+const GROQ_MODEL = "openai/gpt-oss-120b";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
 
 const DATA_DIR = process.env.DATA_DIR || "./data";
