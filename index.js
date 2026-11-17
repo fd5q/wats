@@ -3,6 +3,8 @@ const express = require("express");
 const pino = require("pino");
 const QRCode = require("qrcode");
 const crypto = require("crypto");
+const fs = require("fs/promises");
+const path = require("path");
 
 const {
   default: makeWASocket,
@@ -14,78 +16,67 @@ const app = express();
 app.use(express.json({ limit: "100kb" }));
 
 const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.GEMINI_API_KEY;
 const PASSWORD = process.env.DASHBOARD_PASSWORD;
+const MODEL = "gemini-3.8-flash";
+const DATA_DIR = process.env.DATA_DIR || "./data";
+const DATA_FILE = path.join(DATA_DIR, "bot-data.json");
+const AUTH_DIR = path.join(DATA_DIR, "auth");
 
-if (!PASSWORD) {
-  throw new Error("ضع DASHBOARD_PASSWORD في Render Environment");
-}
+if (!PASSWORD) throw new Error("DASHBOARD_PASSWORD missing");
+if (!API_KEY) throw new Error("GEMINI_API_KEY missing");
 
-let sock;
-let qrImage = null;
+let sock = null;
 let connected = false;
+let qrImage = null;
 let enabled = true;
 let reconnecting = false;
-let messagesCount = 0;
-let repliesCount = 0;
 let lastError = "";
 
-let sessions = new Map();
-let loginAttempts = new Map();
-let lastMessage = new Map();
+let messagesCount = 0;
+let repliesCount = 0;
+
+const sessions = new Map();
+const loginAttempts = new Map();
+const conversations = new Map();
+const lastMessage = new Map();
+const contacts = new Map();
+
+let jobs = [];
 
 let settings = {
+  aiEnabled: true,
+  aiName: "مساعد فهد",
+  aiPrompt: "أنت مساعد واتساب ذكي. تحدث باللغة العربية السعودية بأسلوب طبيعي ومهذب. أجب باختصار ووضوح. لا تدّعِ أنك شخص حقيقي.",
+  aiTemperature: 0.7,
+  maxReplyLength: 500,
   welcome: "أهلاً بك 👋 نورتنا!",
-  away: "حالياً غير متواجد، سيتم الرد عليك لاحقاً.",
   replies: {
     "السلام عليكم": "وعليكم السلام ورحمة الله وبركاته 🌹",
     "هلا": "هلا وغلا 👋",
     "مرحبا": "يا مرحبا فيك ❤️",
     "كيف الحال": "بخير الحمد لله، وأنت؟",
-    "شكرا": "العفو، بالخدمة دائماً ❤️",
-    "شكراً": "العفو، بالخدمة دائماً ❤️",
-    "باي": "في أمان الله 👋"
+    "شكرا": "العفو، بالخدمة دائماً ❤️"
   }
 };
 
-const commands = {
-  "!menu": () => menuText(),
-  "!help": () => menuText(),
-  "!مساعدة": () => menuText(),
-  "!وقت": () => "الوقت الآن: " + new Date().toLocaleTimeString("ar-SA", { timeZone: "Asia/Riyadh" }),
-  "!time": () => "الوقت الآن: " + new Date().toLocaleTimeString("ar-SA", { timeZone: "Asia/Riyadh" }),
-  "!date": () => "التاريخ: " + new Date().toLocaleDateString("ar-SA", { timeZone: "Asia/Riyadh" }),
-  "!تاريخ": () => "التاريخ: " + new Date().toLocaleDateString("ar-SA", { timeZone: "Asia/Riyadh" }),
-  "!about": () => "أنا بوت واتساب آلي 🤖\nأستقبل رسائلك وأرد عليك تلقائياً.",
-  "!من": () => "أنا بوت واتساب آلي 🤖",
-  "!status": () => "حالة البوت: " + (enabled ? "يستقبل الرسائل ويعمل ✅" : "الردود متوقفة حالياً ⏸️"),
-  "!حالة": () => "حالة البوت: " + (enabled ? "يعمل ✅" : "متوقف ⏸️"),
-  "!contact": () => "أرسل رسالتك هنا وسيتم الاطلاع عليها.",
-  "!تواصل": () => "أرسل رسالتك هنا وسيتم الاطلاع عليها.",
-  "!ping": () => "Pong! 🏓 البوت يستجيب.",
-  "!joke": () => "مرة واحد نام متأخر... فاته الحلم 😂",
-  "!نكتة": () => "مرة واحد نام متأخر... فاته الحلم 😂",
-  "!quote": () => "استمر، فالأشياء الجميلة تحتاج إلى صبر ✨",
-  "!حكمة": () => "استمر، فالأشياء الجميلة تحتاج إلى صبر ✨",
-  "!welcome": () => settings.welcome
-};
+function saveData() {
+  return fs.mkdir(DATA_DIR, { recursive: true }).then(() =>
+    fs.writeFile(DATA_FILE, JSON.stringify({ settings, jobs }, null, 2))
+  );
+}
 
-function menuText() {
-  return `🤖 قائمة أوامر البوت
+async function loadData() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
 
-📌 الأوامر:
-!menu — القائمة
-!help — المساعدة
-!time — الوقت
-!date — التاريخ
-!about — معلومات البوت
-!status — حالة البوت
-!contact — التواصل
-!ping — اختبار البوت
-!joke — نكتة
-!quote — حكمة
-!welcome — رسالة الترحيب
-
-أرسل أي أمر لمعرفة نتيجته ❤️`;
+  try {
+    const data = JSON.parse(await fs.readFile(DATA_FILE, "utf8"));
+    if (data.settings) settings = { ...settings, ...data.settings };
+    if (Array.isArray(data.jobs)) jobs = data.jobs;
+  } catch (e) {
+    if (e.code !== "ENOENT") console.error("Data load error:", e.message);
+    await saveData();
+  }
 }
 
 function authenticate(req, res, next) {
@@ -94,21 +85,107 @@ function authenticate(req, res, next) {
 
   if (!token || !expiry || expiry < Date.now()) {
     sessions.delete(token);
-    return res.status(401).json({ error: "Unauthorized" });
+    return res.status(401).json({ error: "انتهت الجلسة، سجل الدخول مجدداً" });
   }
 
   next();
 }
 
+function normalizePhone(value) {
+  let phone = String(value || "").replace(/\D/g, "");
+
+  if (phone.startsWith("00")) phone = phone.slice(2);
+  if (phone.startsWith("05") && phone.length === 10) {
+    phone = "966" + phone.slice(1);
+  }
+
+  if (phone.length < 8 || phone.length > 15) return null;
+  return phone;
+}
+
+async function sendWhatsApp(phone, message) {
+  if (!connected || !sock) throw new Error("واتساب غير متصل");
+  if (!message || message.length > 4000) throw new Error("الرسالة فارغة أو طويلة");
+
+  const jid = phone + "@s.whatsapp.net";
+  await sock.sendMessage(jid, { text: message });
+  repliesCount++;
+}
+
+async function askGemini(jid, userMessage) {
+  const history = conversations.get(jid) || [];
+
+  const contents = [
+    ...history.slice(-12),
+    { role: "user", parts: [{ text: userMessage }] }
+  ];
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": API_KEY
+      },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{
+            text: settings.aiPrompt +
+              "\nاسم المساعد: " + settings.aiName +
+              "\nلا تتجاوز " + settings.maxReplyLength + " حرفاً في الرد."
+          }]
+        },
+        contents,
+        generationConfig: {
+          temperature: Number(settings.aiTemperature),
+          maxOutputTokens: 700
+        }
+      }),
+      signal: AbortSignal.timeout(30000)
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.error?.message || "Gemini API error");
+  }
+
+  const answer = data.candidates?.[0]?.content?.parts
+    ?.map(part => part.text || "")
+    .join("")
+    .trim();
+
+  if (!answer) throw new Error("لم يصل رد من الذكاء الاصطناعي");
+
+  history.push(
+    { role: "user", parts: [{ text: userMessage }] },
+    { role: "model", parts: [{ text: answer }] }
+  );
+
+  conversations.set(jid, history.slice(-16));
+
+  return answer.slice(0, settings.maxReplyLength);
+}
+
+// تسجيل الدخول
 app.post("/api/login", (req, res) => {
   const ip = req.ip;
   const attempts = loginAttempts.get(ip) || { count: 0, until: 0 };
 
   if (attempts.until > Date.now()) {
-    return res.status(429).json({ error: "انتظر قليلاً قبل المحاولة" });
+    return res.status(429).json({ error: "انتظر دقيقة قبل المحاولة" });
   }
 
-  if (req.body.password !== PASSWORD) {
+  const supplied = Buffer.from(String(req.body.password || ""));
+  const expected = Buffer.from(PASSWORD);
+
+  const valid =
+    supplied.length === expected.length &&
+    crypto.timingSafeEqual(supplied, expected);
+
+  if (!valid) {
     attempts.count++;
     if (attempts.count >= 5) {
       attempts.count = 0;
@@ -126,16 +203,21 @@ app.post("/api/login", (req, res) => {
   res.json({ token });
 });
 
+// حالة البوت
 app.get("/api/status", authenticate, (req, res) => {
   res.json({
     connected,
     enabled,
+    aiEnabled: settings.aiEnabled,
     messagesCount,
     repliesCount,
+    contacts: contacts.size,
+    pendingJobs: jobs.filter(j => j.status === "pending").length,
     lastError
   });
 });
 
+// تشغيل وإيقاف الردود
 app.post("/api/control", authenticate, (req, res) => {
   if (req.body.action === "on") enabled = true;
   else if (req.body.action === "off") enabled = false;
@@ -144,112 +226,256 @@ app.post("/api/control", authenticate, (req, res) => {
   res.json({ success: true, enabled });
 });
 
+// إعدادات الذكاء الاصطناعي والردود
 app.get("/api/settings", authenticate, (req, res) => {
   res.json(settings);
 });
 
-app.post("/api/settings", authenticate, (req, res) => {
-  const { welcome, away, replies } = req.body;
+app.post("/api/settings", authenticate, async (req, res) => {
+  const b = req.body;
 
-  if (typeof welcome === "string") settings.welcome = welcome.slice(0, 500);
-  if (typeof away === "string") settings.away = away.slice(0, 500);
+  if (typeof b.aiEnabled === "boolean") settings.aiEnabled = b.aiEnabled;
+  if (typeof b.aiName === "string") settings.aiName = b.aiName.slice(0, 80);
+  if (typeof b.aiPrompt === "string") settings.aiPrompt = b.aiPrompt.slice(0, 3000);
 
-  if (replies && typeof replies === "object" && !Array.isArray(replies)) {
-    const entries = Object.entries(replies).slice(0, 100);
+  if (Number.isFinite(Number(b.aiTemperature))) {
+    settings.aiTemperature = Math.max(0, Math.min(1, Number(b.aiTemperature)));
+  }
 
+  if (Number.isFinite(Number(b.maxReplyLength))) {
+    settings.maxReplyLength = Math.max(50, Math.min(1500, Number(b.maxReplyLength)));
+  }
+
+  if (typeof b.welcome === "string") settings.welcome = b.welcome.slice(0, 500);
+
+  if (b.replies && typeof b.replies === "object" && !Array.isArray(b.replies)) {
     settings.replies = Object.fromEntries(
-      entries
-        .filter(([key, value]) =>
-          typeof key === "string" &&
-          typeof value === "string" &&
-          key.length <= 100 &&
-          value.length <= 1000
-        )
+      Object.entries(b.replies).slice(0, 100).filter(([k, v]) =>
+        typeof k === "string" && typeof v === "string" &&
+        k.length <= 100 && v.length <= 1000
+      )
     );
   }
 
+  await saveData();
   res.json({ success: true });
 });
 
+// إرسال رسالة فورية
+app.post("/api/send", authenticate, async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
+  const message = String(req.body.message || "").trim();
+
+  if (!phone) return res.status(400).json({ error: "رقم الهاتف غير صحيح" });
+  if (!message) return res.status(400).json({ error: "اكتب الرسالة" });
+
+  try {
+    await sendWhatsApp(phone, message);
+    res.json({ success: true, message: "تم إرسال الرسالة" });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// جدولة رسالة
+app.post("/api/schedule", authenticate, async (req, res) => {
+  const phone = normalizePhone(req.body.phone);
+  const message = String(req.body.message || "").trim();
+  const date = new Date(req.body.date);
+
+  if (!phone) return res.status(400).json({ error: "رقم الهاتف غير صحيح" });
+  if (!message) return res.status(400).json({ error: "اكتب الرسالة" });
+  if (message.length > 4000) return res.status(400).json({ error: "الرسالة طويلة جداً" });
+  if (Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) {
+    return res.status(400).json({ error: "اختر موعداً مستقبلياً" });
+  }
+
+  const job = {
+    id: crypto.randomUUID(),
+    phone,
+    message,
+    date: date.toISOString(),
+    status: "pending",
+    createdAt: new Date().toISOString()
+  };
+
+  jobs.push(job);
+  await saveData();
+
+  res.json({ success: true, job });
+});
+
+// عرض المواعيد
+app.get("/api/jobs", authenticate, (req, res) => {
+  res.json(jobs.slice().reverse());
+});
+
+// إلغاء موعد
+app.delete("/api/jobs/:id", authenticate, async (req, res) => {
+  const job = jobs.find(j => j.id === req.params.id);
+
+  if (!job || job.status !== "pending") {
+    return res.status(404).json({ error: "الموعد غير موجود أو تم تنفيذه" });
+  }
+
+  job.status = "cancelled";
+  await saveData();
+  res.json({ success: true });
+});
+
+// قائمة الأشخاص الذين راسلوا البوت
+app.get("/api/contacts", authenticate, (req, res) => {
+  res.json([...contacts.values()]);
+});
+
+// اختبار الذكاء الاصطناعي من لوحة التحكم
+app.post("/api/ai-test", authenticate, async (req, res) => {
+  try {
+    const answer = await askGemini(
+      "dashboard-test",
+      String(req.body.message || "عرف بنفسك")
+    );
+    res.json({ answer });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// QR محمي
 app.get("/api/qr", authenticate, (req, res) => {
   res.json({ qr: qrImage, connected });
 });
 
-app.get("/qr", (req, res) => {
-  res.redirect("/");
-});
-
+// صفحة الداشبورد
 app.get("/", (req, res) => {
   res.send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>لوحة تحكم البوت</title>
+<title>Fahad AI WhatsApp</title>
 <style>
-body{font-family:Arial;background:#101820;color:white;padding:20px;margin:0}
-main{max-width:650px;margin:auto}
-.card{background:#1d2b36;padding:18px;border-radius:14px;margin:14px 0}
-input,textarea{box-sizing:border-box;width:100%;padding:12px;margin:8px 0;border:0;border-radius:8px}
-button{padding:12px 16px;border:0;border-radius:8px;margin:5px;cursor:pointer}
-.green{background:#16a36a;color:white}
-.red{background:#c0392b;color:white}
-#panel{display:none}
-#qr{max-width:280px;width:100%;background:white}
-pre{white-space:pre-wrap;word-break:break-word}
+*{box-sizing:border-box}
+body{font-family:Arial;background:#101820;color:white;margin:0;padding:16px}
+main{max-width:850px;margin:auto}
+.card{background:#1d2b36;padding:18px;border-radius:14px;margin:13px 0}
+input,textarea,button{font:inherit;border-radius:8px;padding:12px}
+input,textarea{width:100%;margin:7px 0;border:1px solid #425462;background:#101820;color:white}
+button{border:0;margin:5px;cursor:pointer;background:#344b5b;color:white}
+.green{background:#159767}
+.red{background:#b63c3c}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.small{color:#b9c9d4;font-size:13px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}
+img{max-width:260px;background:white}
+.hidden{display:none}
+h2,h3{margin-top:5px}
 </style>
 </head>
 <body>
 <main>
-<h2>🤖 لوحة تحكم بوت واتساب</h2>
+<h2>🤖 Fahad AI WhatsApp</h2>
+<p class="small">لوحة تحكم المالك</p>
 
 <div class="card" id="login">
-<h3>دخول المالك فقط</h3>
-<input id="password" type="password" placeholder="كلمة مرور لوحة التحكم">
+<h3>دخول المالك</h3>
+<input id="password" type="password" placeholder="كلمة مرور الداشبورد">
 <button class="green" onclick="login()">دخول</button>
 <p id="loginMsg"></p>
 </div>
 
-<div id="panel">
+<div id="panel" class="hidden">
+
+<div class="grid">
+<div class="card"><h3>الاتصال</h3><p id="connection">...</p></div>
+<div class="card"><h3>الردود</h3><p id="replyState">...</p></div>
+<div class="card"><h3>الذكاء الاصطناعي</h3><p id="aiState">...</p></div>
+<div class="card"><h3>الإحصائيات</h3><p id="stats">...</p></div>
+</div>
+
 <div class="card">
-<h3>حالة البوت</h3>
-<p id="status">جاري التحميل...</p>
+<h3>التحكم بالبوت</h3>
 <button class="green" onclick="control('on')">تشغيل الردود</button>
 <button class="red" onclick="control('off')">إيقاف الردود</button>
-<button onclick="refresh()">تحديث الحالة</button>
+<button onclick="refresh()">تحديث</button>
+<p id="lastError"></p>
 </div>
 
 <div class="card">
-<h3>ربط واتساب QR</h3>
-<p>لا تشارك هذا الرمز مع أحد.</p>
-<img id="qr" style="display:none">
-<p id="qrText">جاري فحص الاتصال...</p>
+<h3>📱 ربط واتساب</h3>
+<img id="qr" class="hidden">
+<p id="qrText">جاري الفحص...</p>
 </div>
 
 <div class="card">
-<h3>تعديل الردود</h3>
-<label>رسالة الترحيب</label>
-<textarea id="welcome" rows="2"></textarea>
-<label>رسالة الغياب</label>
-<textarea id="away" rows="2"></textarea>
-<label>الردود التلقائية (JSON)</label>
-<textarea id="replies" rows="10"></textarea>
-<button class="green" onclick="saveSettings()">حفظ الإعدادات</button>
-<p id="saveMsg"></p>
+<h3>💬 إرسال رسالة الآن</h3>
+<input id="sendPhone" placeholder="رقم المستلم مع مفتاح الدولة">
+<textarea id="sendMessage" placeholder="اكتب رسالتك"></textarea>
+<button class="green" onclick="sendNow()">إرسال الآن</button>
+<p id="sendResult"></p>
 </div>
 
 <div class="card">
-<h3>إحصائيات</h3>
-<p id="stats"></p>
+<h3>⏰ جدولة رسالة</h3>
+<input id="jobPhone" placeholder="رقم المستلم">
+<textarea id="jobMessage" placeholder="نص الرسالة"></textarea>
+<label>موعد الإرسال حسب توقيت جهازك</label>
+<input id="jobDate" type="datetime-local">
+<button class="green" onclick="schedule()">حفظ الموعد</button>
+<p id="jobResult"></p>
+<h3>المواعيد المجدولة</h3>
+<div id="jobs">...</div>
 </div>
+
+<div class="card">
+<h3>🧠 إعدادات الذكاء الاصطناعي</h3>
+<label><input type="checkbox" id="aiEnabled" style="width:auto"> تفعيل ردود Gemini</label>
+<input id="aiName" placeholder="اسم المساعد">
+<label>تعليمات شخصية المساعد</label>
+<textarea id="aiPrompt" rows="5"></textarea>
+<label>درجة الإبداع: <span id="tempValue">0.7</span></label>
+<input type="range" id="temperature" min="0" max="1" step="0.1" value="0.7" oninput="tempValue.innerText=this.value">
+<label>أقصى طول للرد</label>
+<input type="number" id="maxLength" min="50" max="1500">
+<button class="green" onclick="saveSettings()">حفظ إعدادات الذكاء</button>
+<p id="settingsResult"></p>
+</div>
+
+<div class="card">
+<h3>🧪 تجربة الذكاء الاصطناعي</h3>
+<textarea id="testMessage" placeholder="اكتب سؤالاً لتجربة Gemini"></textarea>
+<button onclick="testAI()">جرّب الذكاء الاصطناعي</button>
+<pre id="testResult"></pre>
+</div>
+
+<div class="card">
+<h3>📝 الردود التلقائية</h3>
+<p class="small">اكتب الردود بصيغة JSON، مثال: {"هلا":"هلا فيك"}</p>
+<textarea id="replies" rows="9"></textarea>
+<input id="welcome" placeholder="رسالة الترحيب">
+<button class="green" onclick="saveSettings()">حفظ الردود</button>
+</div>
+
+<div class="card">
+<h3>👥 الأشخاص الذين راسلوا البوت</h3>
+<button onclick="loadContacts()">تحديث القائمة</button>
+<div id="contacts"></div>
+</div>
+
+<div class="card">
+<h3>🛡️ معلومات الأمان</h3>
+<p class="small">كل عمليات الإدارة والإرسال والجدولة محمية بتسجيل دخول المالك. لا تشارك كلمة المرور أو رمز QR.</p>
+<button class="red" onclick="logout()">تسجيل الخروج</button>
+</div>
+
 </div>
 </main>
 
 <script>
 let token = "";
 
-async function api(path, method="GET", body=null) {
-  const r = await fetch(path, {
+async function api(url, method="GET", body=null) {
+  const r = await fetch(url, {
     method,
     headers: {
       "Content-Type":"application/json",
@@ -257,106 +483,238 @@ async function api(path, method="GET", body=null) {
     },
     body: body ? JSON.stringify(body) : null
   });
-  if (!r.ok) throw new Error("انتهت الجلسة أو حدث خطأ");
-  return r.json();
+
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || "حدث خطأ");
+  return data;
 }
 
 async function login() {
-  const r = await fetch("/api/login", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({password:document.getElementById("password").value})
-  });
-  const d = await r.json();
-  if (!r.ok) {
-    document.getElementById("loginMsg").innerText = d.error || "فشل الدخول";
-    return;
+  try {
+    const r = await fetch("/api/login", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({password:password.value})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+
+    token = d.token;
+    sessionStorage.setItem("ownerToken", token);
+    document.getElementById("login").classList.add("hidden");
+    document.getElementById("panel").classList.remove("hidden");
+
+    await refresh();
+    await loadSettings();
+    await loadQR();
+    await loadJobs();
+    await loadContacts();
+  } catch(e) {
+    loginMsg.innerText = e.message;
   }
-  token = d.token;
-  document.getElementById("login").style.display="none";
-  document.getElementById("panel").style.display="block";
-  await refresh();
-  await loadSettings();
-  await loadQR();
 }
 
 async function refresh() {
   try {
     const d = await api("/api/status");
-    document.getElementById("status").innerText =
-      "الاتصال: "+(d.connected?"متصل ✅":"غير متصل ❌")+
-      "\\nالردود: "+(d.enabled?"مفعلة ✅":"متوقفة ⏸️")+
-      "\\nآخر خطأ: "+(d.lastError || "لا يوجد");
-    document.getElementById("stats").innerText =
-      "الرسائل المستلمة: "+d.messagesCount+
-      "\\nالردود المرسلة: "+d.repliesCount;
-  } catch(e) { alert(e.message); }
+    connection.innerText = d.connected ? "متصل ✅" : "غير متصل ❌";
+    replyState.innerText = d.enabled ? "مفعلة ✅" : "متوقفة ⏸️";
+    aiState.innerText = d.aiEnabled ? "مفعل 🧠" : "متوقف";
+    stats.innerText = "الرسائل: "+d.messagesCount+
+      "\\nالردود: "+d.repliesCount+
+      "\\nالأشخاص: "+d.contacts+
+      "\\nالمواعيد القادمة: "+d.pendingJobs;
+    lastError.innerText = "آخر خطأ: "+(d.lastError || "لا يوجد");
+  } catch(e) { logout(); }
 }
 
 async function control(action) {
-  await api("/api/control","POST",{action});
-  await refresh();
+  try {
+    await api("/api/control","POST",{action});
+    await refresh();
+  } catch(e) { alert(e.message); }
 }
 
 async function loadSettings() {
   const d = await api("/api/settings");
-  document.getElementById("welcome").value=d.welcome;
-  document.getElementById("away").value=d.away;
-  document.getElementById("replies").value=JSON.stringify(d.replies,null,2);
+  aiEnabled.checked = d.aiEnabled;
+  aiName.value = d.aiName;
+  aiPrompt.value = d.aiPrompt;
+  temperature.value = d.aiTemperature;
+  tempValue.innerText = d.aiTemperature;
+  maxLength.value = d.maxReplyLength;
+  replies.value = JSON.stringify(d.replies,null,2);
+  welcome.value = d.welcome;
 }
 
 async function saveSettings() {
   try {
-    const replies=JSON.parse(document.getElementById("replies").value);
+    const parsed = JSON.parse(replies.value || "{}");
     await api("/api/settings","POST",{
-      welcome:document.getElementById("welcome").value,
-      away:document.getElementById("away").value,
-      replies
+      aiEnabled:aiEnabled.checked,
+      aiName:aiName.value,
+      aiPrompt:aiPrompt.value,
+      aiTemperature:Number(temperature.value),
+      maxReplyLength:Number(maxLength.value),
+      replies:parsed,
+      welcome:welcome.value
     });
-    document.getElementById("saveMsg").innerText="تم حفظ الإعدادات ✅";
+    settingsResult.innerText = "تم الحفظ بنجاح ✅";
+    await refresh();
   } catch(e) {
-    document.getElementById("saveMsg").innerText="تأكد من صيغة JSON";
+    settingsResult.innerText = "خطأ: "+e.message;
   }
+}
+
+async function sendNow() {
+  try {
+    const d = await api("/api/send","POST",{
+      phone:sendPhone.value,
+      message:sendMessage.value
+    });
+    sendResult.innerText = d.message+" ✅";
+  } catch(e) {
+    sendResult.innerText = e.message;
+  }
+}
+
+async function schedule() {
+  try {
+    const d = await api("/api/schedule","POST",{
+      phone:jobPhone.value,
+      message:jobMessage.value,
+      date:new Date(jobDate.value).toISOString()
+    });
+    jobResult.innerText = "تمت جدولة الرسالة ✅";
+    await loadJobs();
+    await refresh();
+  } catch(e) {
+    jobResult.innerText = e.message;
+  }
+}
+
+async function loadJobs() {
+  const list = await api("/api/jobs");
+  jobs.innerHTML = list.map(j =>
+    "<div class='card'><b>"+j.phone+"</b><p>"+j.message+"</p>"+
+    "<p class='small'>"+new Date(j.date).toLocaleString("ar-SA")+
+    " — "+j.status+"</p>"+
+    (j.status==="pending" ?
+      "<button class='red' onclick='cancelJob(\""+j.id+"\")'>إلغاء</button>" : "")+
+    "</div>"
+  ).join("") || "لا توجد مواعيد";
+}
+
+async function cancelJob(id) {
+  try {
+    await api("/api/jobs/"+id,"DELETE");
+    await loadJobs();
+    await refresh();
+  } catch(e) { alert(e.message); }
 }
 
 async function loadQR() {
   try {
-    const d=await api("/api/qr");
-    const img=document.getElementById("qr");
-    if(d.connected) {
-      img.style.display="none";
-      document.getElementById("qrText").innerText="واتساب متصل بالفعل ✅";
-    } else if(d.qr) {
-      img.src=d.qr;
-      img.style.display="block";
-      document.getElementById("qrText").innerText="امسح الرمز من واتساب";
+    const d = await api("/api/qr");
+    if (d.connected) {
+      qr.classList.add("hidden");
+      qrText.innerText = "واتساب متصل بالفعل ✅";
+    } else if (d.qr) {
+      qr.src = d.qr;
+      qr.classList.remove("hidden");
+      qrText.innerText = "امسح الرمز من واتساب";
     } else {
-      img.style.display="none";
-      document.getElementById("qrText").innerText="انتظر إنشاء رمز QR...";
+      qr.classList.add("hidden");
+      qrText.innerText = "بانتظار رمز QR...";
     }
   } catch(e) {}
 }
 
-setInterval(()=>{ if(token){refresh();loadQR();} },10000);
+async function testAI() {
+  testResult.innerText = "جاري التفكير...";
+  try {
+    const d = await api("/api/ai-test","POST",{message:testMessage.value});
+    testResult.innerText = d.answer;
+  } catch(e) {
+    testResult.innerText = e.message;
+  }
+}
+
+async function loadContacts() {
+  try {
+    const list = await api("/api/contacts");
+    contacts.innerHTML = list.map(c =>
+      "<div class='card'>"+c.phone+
+      "<p class='small'>آخر رسالة: "+new Date(c.lastSeen).toLocaleString("ar-SA")+"</p></div>"
+    ).join("") || "لا يوجد أشخاص بعد";
+  } catch(e) {}
+}
+
+function logout() {
+  token = "";
+  sessionStorage.removeItem("ownerToken");
+  location.reload();
+}
+
+token = sessionStorage.getItem("ownerToken") || "";
+if (token) {
+  login().catch(logout);
+}
+
+setInterval(() => {
+  if (token) {
+    refresh();
+    loadQR();
+    loadJobs();
+  }
+},15000);
 </script>
 </body>
 </html>`);
 });
 
-app.listen(PORT, () => console.log("Server running on " + PORT));
+// تنفيذ المواعيد المجدولة
+async function processJobs() {
+  if (!connected || !sock) return;
 
+  const now = Date.now();
+
+  for (const job of jobs) {
+    if (job.status !== "pending" || new Date(job.date).getTime() > now) continue;
+
+    // نعلّم الموعد قيد التنفيذ حتى لا يتكرر
+    job.status = "sending";
+    await saveData();
+
+    try {
+      await sendWhatsApp(job.phone, job.message);
+      job.status = "sent";
+      job.sentAt = new Date().toISOString();
+    } catch(e) {
+      job.status = "failed";
+      job.error = e.message;
+      lastError = e.message;
+    }
+
+    await saveData();
+  }
+}
+
+// تشغيل واتساب
 async function startBot() {
   if (reconnecting) return;
   reconnecting = true;
 
   try {
-    const { state, saveCreds } = await useMultiFileAuthState("./auth_info_baileys");
+    await fs.mkdir(AUTH_DIR, { recursive: true });
+
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
     sock = makeWASocket({
       auth: state,
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
-      browser: ["Fahad Bot", "Chrome", "1.0.0"]
+      browser: ["Fahad AI Bot", "Chrome", "1.0.0"]
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -367,7 +725,6 @@ async function startBot() {
       if (qr) {
         qrImage = await QRCode.toDataURL(qr);
         connected = false;
-        console.log("QR is ready. Open the dashboard to scan it.");
       }
 
       if (connection === "open") {
@@ -387,8 +744,6 @@ async function startBot() {
 
         if (code !== DisconnectReason.loggedOut) {
           setTimeout(startBot, 5000);
-        } else {
-          console.log("Session logged out. Pair again using QR.");
         }
       }
     });
@@ -411,48 +766,75 @@ async function startBot() {
 
         messagesCount++;
 
-        const now = Date.now();
+        const phone = jid.split("@")[0];
+        contacts.set(jid, {
+          phone,
+          lastSeen: new Date().toISOString()
+        });
+
         const previous = lastMessage.get(jid) || 0;
-        if (now - previous < 1500) continue;
-        lastMessage.set(jid, now);
+        if (Date.now() - previous < 2500) continue;
+        lastMessage.set(jid, Date.now());
 
         const input = text.trim();
-        const command = input.toLowerCase();
+        const key = input.toLowerCase();
 
         let answer = null;
 
-        if (commands[command]) {
-          answer = commands[command]();
+        if (key === "!menu" || key === "!help" || key === "!مساعدة") {
+          answer = "🤖 قائمة الأوامر\\n!menu - القائمة\\n!time - الوقت\\n!date - التاريخ\\n!ping - اختبار البوت\\n!about - معلومات البوت";
+        } else if (key === "!time") {
+          answer = new Date().toLocaleTimeString("ar-SA", { timeZone: "Asia/Riyadh" });
+        } else if (key === "!date") {
+          answer = new Date().toLocaleDateString("ar-SA", { timeZone: "Asia/Riyadh" });
+        } else if (key === "!ping") {
+          answer = "Pong! 🏓";
+        } else if (key === "!about") {
+          answer = "أنا مساعد واتساب ذكي 🤖";
         } else {
           const matchingKey = Object.keys(settings.replies)
-            .find(key => key.toLowerCase() === command);
+            .find(k => k.toLowerCase() === key);
 
-          if (matchingKey) {
-            answer = settings.replies[matchingKey];
-          } else if (/^(السلام عليكم|سلام عليكم)$/i.test(input)) {
-            answer = settings.replies["السلام عليكم"];
-          }
+          if (matchingKey) answer = settings.replies[matchingKey];
         }
 
-        if (answer) {
-          try {
+        try {
+          if (!answer && settings.aiEnabled) {
+            answer = await askGemini(jid, input);
+          }
+
+          if (answer) {
             await sock.sendMessage(jid, { text: answer });
             repliesCount++;
-          } catch (err) {
-            lastError = err.message;
-            console.error("Send error:", err.message);
           }
+        } catch(e) {
+          lastError = e.message;
+          console.error("Message error:", e.message);
         }
       }
     });
 
-  } catch (err) {
+  } catch(e) {
     connected = false;
     reconnecting = false;
-    lastError = err.message;
-    console.error("Bot start error:", err);
+    lastError = e.message;
+    console.error("Bot startup error:", e.message);
     setTimeout(startBot, 10000);
   }
 }
 
-startBot();
+async function main() {
+  await loadData();
+
+  app.listen(PORT, () => {
+    console.log("Dashboard server running on port " + PORT);
+  });
+
+  setInterval(processJobs, 10000);
+  await startBot();
+}
+
+main().catch(e => {
+  console.error("Fatal error:", e);
+  process.exit(1);
+});
